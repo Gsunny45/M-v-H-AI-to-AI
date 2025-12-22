@@ -1,0 +1,2374 @@
+large 4 phasedashboard dashboard dashboard dashboard 
+# cog_foundation_v2.py - Enhanced COG Foundation
+# Batch Processing | Workflow Templates | Performance Dashboard
+# KEY NORMALIZATION | ENV CONFIG SUPPORT | TOKEN LIMIT CONTROL
+
+import os
+import sys
+import time
+import json
+import uuid
+import urllib.request
+import urllib.error
+import socket
+import importlib.util
+from datetime import datetime
+from pathlib import Path
+from dataclasses import dataclass, field, asdict
+from typing import Dict, List, Optional, Tuple, Any
+from enum import Enum
+import re
+import math
+
+# ══════════════════════════════════════════════════════════════════════════════
+# UTILITY FUNCTIONS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def extract_json(text: str) -> Optional[Dict]:
+    """Robustly extract JSON from any text format"""
+    if not text:
+        return None
+    
+    # Try direct JSON parsing first
+    try:
+        return json.loads(text.strip())
+    except:
+        pass
+    
+    # Try extracting JSON from code blocks
+    json_pattern = r'```(?:json)?\s*(\{.*?\}|\[.*?\])\s*```'
+    matches = re.findall(json_pattern, text, re.DOTALL | re.IGNORECASE)
+    
+    for match in matches:
+        try:
+            return json.loads(match.strip())
+        except:
+            continue
+    
+    # Try finding JSON-like structures
+    try:
+        text_clean = text.replace('\n', ' ').replace('\r', ' ')
+        brace_start = text_clean.find('{')
+        brace_end = text_clean.rfind('}')
+        
+        if brace_start != -1 and brace_end > brace_start:
+            potential_json = text_clean[brace_start:brace_end+1]
+            return json.loads(potential_json)
+    except:
+        pass
+    
+    return None
+
+
+def estimate_tokens(text: str, provider_type: str = "openai") -> int:
+    """Rough token estimation for cost calculation"""
+    if not text:
+        return 0
+    chars_per_token = {
+        "anthropic": 3.8,
+        "openai": 3.5,
+        "cohere": 4.0,
+        "ollama": 4.0,
+        "default": 3.8
+    }
+    ratio = chars_per_token.get(provider_type, chars_per_token["default"])
+    return max(1, int(len(text) / ratio))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# RESPONSE PARSERS WITH ERROR PROPAGATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _extract_openai_text(result: Dict) -> Tuple[Optional[str], Optional[str]]:
+    """Safely extract text from OpenAI-compatible response.
+    Returns: (text, error_message)
+    """
+    if not result:
+        return None, "Empty response"
+    
+    # Check for error field
+    if "error" in result:
+        err = result["error"]
+        if isinstance(err, dict):
+            error_type = err.get("type", "error")
+            error_msg = err.get("message", "Unknown error")
+            return None, f"{error_type}: {error_msg}"
+        return None, str(err)
+    
+    # Try standard OpenAI format: choices[0].message.content
+    choices = result.get("choices")
+    if not choices:
+        return None, "No 'choices' field in response"
+    
+    if not isinstance(choices, list) or len(choices) == 0:
+        return None, "Empty choices list"
+    
+    first_choice = choices[0]
+    if not isinstance(first_choice, dict):
+        return None, "First choice is not a dict"
+    
+    message = first_choice.get("message")
+    if message and isinstance(message, dict) and "content" in message:
+        content = message["content"]
+        if content is not None:
+            return str(content), None
+    
+    # Try alternative format: choices[0].text
+    if "text" in first_choice:
+        text = first_choice["text"]
+        if text is not None:
+            return str(text), None
+    
+    # Try direct content field
+    if "content" in result:
+        content = result["content"]
+        if content is not None:
+            return str(content), None
+    
+    # Debug: log unexpected structure
+    return None, f"Unexpected response structure: {str(result)[:200]}"
+
+
+def _extract_anthropic_text(result: Dict) -> Tuple[Optional[str], Optional[str]]:
+    """Safely extract text from Anthropic response with multiple content blocks.
+    Returns: (text, error_message)
+    """
+    if not result:
+        return None, "Empty response"
+    
+    # Check for error
+    if "error" in result:
+        err = result["error"]
+        if isinstance(err, dict):
+            error_type = err.get("type", "error")
+            error_msg = err.get("message", "Unknown error")
+            return None, f"{error_type}: {error_msg}"
+        return None, str(err)
+    
+    blocks = result.get("content")
+    if not blocks or not isinstance(blocks, list):
+        return None, "No valid content blocks"
+    
+    texts = []
+    for block in blocks:
+        if isinstance(block, dict):
+            # Anthropic format: {"type": "text", "text": "..."}
+            if block.get("type") == "text" and block.get("text"):
+                texts.append(block["text"])
+            # Direct text field
+            elif block.get("text"):
+                texts.append(block["text"])
+            # Nested content
+            elif "content" in block and isinstance(block["content"], str):
+                texts.append(block["content"])
+    
+    if not texts:
+        return None, "No text content found in response"
+    
+    # Join all text blocks
+    return "\n\n".join(texts).strip(), None
+
+
+def _extract_cohere_text(result: Dict) -> Tuple[Optional[str], Optional[str]]:
+    """Safely extract text from Cohere response.
+    Returns: (text, error_message)
+    """
+    if not result:
+        return None, "Empty response"
+    
+    # Check for error
+    if "error" in result:
+        err = result["error"]
+        if isinstance(err, dict):
+            error_msg = err.get("message", "Unknown error")
+            return None, f"Cohere error: {error_msg}"
+        return None, f"Cohere error: {err}"
+    
+    # Cohere format: {"text": "..."}
+    if "text" in result and result["text"]:
+        return str(result["text"]), None
+    
+    # Alternative format for chat completions
+    if "generations" in result and isinstance(result["generations"], list):
+        generations = result["generations"]
+        if generations and generations[0] and "text" in generations[0]:
+            return str(generations[0]["text"]), None
+    
+    return None, "No text found in Cohere response"
+
+
+def parse_response(provider_type: str, result: Dict) -> Tuple[Optional[str], Optional[str]]:
+    """Unified response parser dispatcher.
+    Returns: (text, error_message)
+    """
+    if provider_type == "openai":
+        return _extract_openai_text(result)
+    elif provider_type == "anthropic":
+        return _extract_anthropic_text(result)
+    elif provider_type == "cohere":
+        return _extract_cohere_text(result)
+    elif provider_type == "ollama":
+        # Ollama format: {"message": {"content": "..."}}
+        if result and "message" in result:
+            message = result["message"]
+            if isinstance(message, dict) and "content" in message:
+                return str(message["content"]), None
+        return None, "Invalid Ollama response format"
+    else:
+        # Generic fallback
+        if isinstance(result, dict):
+            for key in ["content", "text", "output", "response"]:
+                if key in result and result[key]:
+                    return str(result[key]), None
+        return None, f"No parser for provider type: {provider_type}"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# KEY MANAGEMENT WITH ALIAS SUPPORT
+# ══════════════════════════════════════════════════════════════════════════════
+
+KEYS: Dict[str, str] = {}
+
+# Key aliases for environment variable compatibility
+KEY_ALIASES = {
+    # common env-style names -> internal provider ids
+    "OPENAI_API_KEY": "openai",
+    "ANTHROPIC_API_KEY": "claude",
+    "GROQ_API_KEY": "groq",
+    "DEEPSEEK_API_KEY": "deepseek",
+    "TOGETHER_API_KEY": "together",
+    "FIREWORKS_API_KEY": "fireworks",
+    "NEBIUS_API_KEY": "nebius",
+    "HYPERBOLIC_API_KEY": "hyperbolic",
+    "OPENROUTER_API_KEY": "openrouter",
+    "PERPLEXITY_API_KEY": "perplexity",
+    "MISTRAL_API_KEY": "mistral",
+    "COHERE_API_KEY": "cohere",
+    "SERPER_API_KEY": "serper",
+    "SAMBANOVA_API_KEY": "sambanova",
+    "SKYWORK_API_KEY": "skywork",
+    "XAI_API_KEY": "grok",  # x.ai uses XAI_API_KEY
+}
+
+
+def has_key(provider: str) -> bool:
+    """Check if valid key exists for provider (internal id after normalization)"""
+    key = KEYS.get(provider, "")
+    return bool(key and "PASTE" not in key.upper() and len(key) > 10)
+
+
+def has_auth(provider: str) -> bool:
+    """Check if provider is available (has key if required)."""
+    cfg = PROVIDERS.get(provider, {})
+    if not cfg:
+        return False
+    
+    # If provider doesn't require a key, it's available (local will be checked separately)
+    if not cfg.get("requires_key", True):
+        return True
+    
+    # Check for valid API key
+    return has_key(provider)
+
+
+def _normalize_keys():
+    """Normalize key names from various formats to internal provider IDs"""
+    global KEYS
+    
+    normalized: Dict[str, str] = {}
+    
+    # Normalize env-var style keys to internal ids
+    for k, v in KEYS.items():
+        if not v:
+            continue
+        k2 = KEY_ALIASES.get(k, k)
+        # If duplicates exist, keep the longer-looking key (usually safer)
+        if k2 not in normalized or len(v) > len(normalized[k2]):
+            normalized[k2] = v
+    
+    # Ensure BOTH aliases exist for Anthropic
+    if "claude" in normalized and "anthropic" not in normalized:
+        normalized["anthropic"] = normalized["claude"]
+    if "anthropic" in normalized and "claude" not in normalized:
+        normalized["claude"] = normalized["anthropic"]
+    
+    # Update global KEYS
+    KEYS.clear()
+    KEYS.update(normalized)
+
+
+def load_keys(vault_root: Path) -> Dict[str, bool]:
+    """Load API keys, return status dict"""
+    global KEYS
+    
+    paths = [
+        vault_root / "cog_keys.py",
+        vault_root / "Fire_Keys" / "cog_keys.py",
+        Path("cog_keys.py"),
+    ]
+    
+    # Add environment variables (complete, generic loading)
+    for env_name in KEY_ALIASES.keys():
+        val = os.getenv(env_name)
+        if val and val.strip():
+            KEYS[env_name] = val.strip()
+    
+    # Load from key files
+    for p in paths:
+        if p.exists():
+            try:
+                spec = importlib.util.spec_from_file_location("cog_keys", p)
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                if hasattr(module, "KEYS"):
+                    KEYS.update(module.KEYS)
+                    break
+            except Exception as e:
+                print(f"Key load error: {e}")
+    
+    # Normalize all keys
+    _normalize_keys()
+    
+    # Return status of each key
+    status = {}
+    for k, v in KEYS.items():
+        status[k] = bool(v and "PASTE" not in v.upper() and len(v) > 10)
+    return status
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONFIGURATION WITH ENV SUPPORT
+# ══════════════════════════════════════════════════════════════════════════════
+
+class Config:
+    """Environment-aware configuration with all paths and settings"""
+    
+    def __init__(self):
+        # Auto-detect environment
+        self.is_android = os.path.exists("/storage/emulated/0")
+        self.is_windows = os.name == 'nt'
+        
+        if self.is_android:
+            base = Path("/storage/emulated/0")
+        elif self.is_windows:
+            base = Path(r"C:\Users\HP\Documents")
+        else:
+            base = Path.home()
+        
+        # Core paths
+        self.VAULT_ROOT = Path(os.getenv("OBSIDIAN_VAULT", base / "HOME OBSIDIAN"))
+        
+        # Obsidian structure
+        self.INBOX = self.VAULT_ROOT / "00_INBOX"
+        self.DRAFTS = self.VAULT_ROOT / "10_AI_Drafts"
+        self.SUMMARIES = self.VAULT_ROOT / "20_Summaries"
+        self.KEEP = self.VAULT_ROOT / "30_KEEP"
+        self.PROTOCOLS = self.VAULT_ROOT / "COG_Protocols"
+        self.MEMORY = self.VAULT_ROOT / "06_Memory"
+        
+        # COG Bus system
+        self.BUS = self.PROTOCOLS / "BUS"
+        self.BUS_PENDING = self.BUS / "pending"
+        self.BUS_PROCESSING = self.BUS / "processing"
+        self.BUS_COMPLETE = self.BUS / "complete"
+        self.BUS_DEAD = self.BUS / "dead_letter"
+        
+        # Outputs
+        self.ARTIFACTS = self.PROTOCOLS / "artifacts"
+        self.LOGS = self.PROTOCOLS / "logs"
+        self.MONITOR = self.PROTOCOLS / "monitor.json"
+        
+        # RAG paths
+        self.RAG_CHUNKS = self.VAULT_ROOT / "03_Chunks"
+        
+        # Settings with environment variable support
+        self.TIMEOUT = int(os.getenv("COG_TIMEOUT", "45"))
+        self.MAX_TOKENS = int(os.getenv("COG_MAX_TOKENS", "1200"))
+        self.MAX_WORKERS = int(os.getenv("COG_MAX_WORKERS", "4"))
+        self.ENABLE_CIRCUIT_BREAKER = os.getenv("COG_ENABLE_CIRCUIT_BREAKER", "true").lower() == "true"
+        self.CIRCUIT_FAILURE_THRESHOLD = int(os.getenv("COG_CIRCUIT_FAILURE_THRESHOLD", "3"))
+        self.CIRCUIT_RESET_TIMEOUT = int(os.getenv("COG_CIRCUIT_RESET_TIMEOUT", "300"))
+        
+        # Logging
+        self.LOG_LEVEL = os.getenv("COG_LOG_LEVEL", "INFO")
+        self.ENABLE_METRICS = os.getenv("COG_ENABLE_METRICS", "true").lower() == "true"
+        
+        self._create_dirs()
+    
+    def _create_dirs(self):
+        dirs = [
+            self.INBOX, self.DRAFTS, self.SUMMARIES, self.KEEP,
+            self.PROTOCOLS, self.MEMORY, self.BUS,
+            self.BUS_PENDING, self.BUS_PROCESSING, self.BUS_COMPLETE, self.BUS_DEAD,
+            self.ARTIFACTS, self.LOGS, self.RAG_CHUNKS
+        ]
+        for d in dirs:
+            d.mkdir(parents=True, exist_ok=True)
+    
+    def to_dict(self) -> Dict:
+        """Return configuration as dictionary"""
+        return {
+            "vault_root": str(self.VAULT_ROOT),
+            "timeout": self.TIMEOUT,
+            "max_tokens": self.MAX_TOKENS,
+            "max_workers": self.MAX_WORKERS,
+            "enable_circuit_breaker": self.ENABLE_CIRCUIT_BREAKER,
+            "circuit_failure_threshold": self.CIRCUIT_FAILURE_THRESHOLD,
+            "circuit_reset_timeout": self.CIRCUIT_RESET_TIMEOUT,
+            "log_level": self.LOG_LEVEL,
+            "enable_metrics": self.ENABLE_METRICS
+        }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DATA STRUCTURES
+# ══════════════════════════════════════════════════════════════════════════════
+
+class Phase(Enum):
+    PLAN = "plan"
+    CRITIQUE = "critique"
+    EXECUTE = "execute"
+    OUTPUT = "output"
+
+class Status(Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETE = "complete"
+    FAILED = "failed"
+
+@dataclass
+class ReasoningBranch:
+    """One approach in divergent planning"""
+    approach: str
+    risk: str
+    score: float = 0.0
+
+@dataclass 
+class ReasoningResult:
+    """Complete 4-phase reasoning output"""
+    task_id: str
+    timestamp: str
+    
+    # Phase 1: Divergent Planning
+    branches: List[ReasoningBranch] = field(default_factory=list)
+    selected_branch: int = 0
+    
+    # Phase 2: Critique
+    critique: str = ""
+    refinements: List[str] = field(default_factory=list)
+    
+    # Phase 3: Execute
+    execution_log: List[Dict] = field(default_factory=list)
+    
+    # Phase 4: Output
+    final_output: str = ""
+    output_format: str = "text"  # text, json, code, yaml
+    
+    # Meta
+    total_latency_ms: int = 0
+    providers_used: List[str] = field(default_factory=list)
+    status: str = "pending"
+    error: str = ""
+    
+    def to_json(self) -> str:
+        return json.dumps(asdict(self), indent=2, default=str)
+    
+    def save(self, path: Path):
+        path.write_text(self.to_json(), encoding='utf-8')
+
+@dataclass
+class MonitorState:
+    """System monitoring state with cost tracking"""
+    last_update: str = ""
+    total_calls: int = 0
+    total_latency_ms: int = 0
+    total_cost: float = 0.0
+    total_tokens_in: int = 0
+    total_tokens_out: int = 0
+    calls_by_provider: Dict[str, int] = field(default_factory=dict)
+    latency_by_provider: Dict[str, int] = field(default_factory=dict)
+    errors_by_provider: Dict[str, int] = field(default_factory=dict)
+    cost_by_provider: Dict[str, float] = field(default_factory=dict)
+    tokens_by_provider: Dict[str, int] = field(default_factory=dict)
+    active_tasks: List[str] = field(default_factory=list)
+    
+    def record_call(self, provider: str, latency_ms: int, success: bool,
+                   input_tokens: int = 0, output_tokens: int = 0):
+        self.last_update = datetime.now().isoformat()
+        self.total_calls += 1
+        self.total_latency_ms += latency_ms
+        self.calls_by_provider[provider] = self.calls_by_provider.get(provider, 0) + 1
+        self.latency_by_provider[provider] = self.latency_by_provider.get(provider, 0) + latency_ms
+        
+        if not success:
+            self.errors_by_provider[provider] = self.errors_by_provider.get(provider, 0) + 1
+        
+        # Cost tracking with unit standardization
+        if provider in PROVIDERS and success and (input_tokens > 0 or output_tokens > 0):
+            cfg = PROVIDERS[provider]
+            
+            # Determine divisor based on cost_unit
+            cost_unit = cfg.get("cost_unit", "per_1k")
+            if cost_unit == "per_1k":
+                divisor = 1000
+            elif cost_unit == "per_1M":
+                divisor = 1000000
+            elif cost_unit == "per_token":
+                divisor = 1
+            else:
+                # Default to per 1K tokens
+                divisor = 1000
+            
+            input_cost_per = cfg.get("cost_in", 0.001)
+            output_cost_per = cfg.get("cost_out", 0.002)
+            
+            input_cost = (input_tokens / divisor) * input_cost_per
+            output_cost = (output_tokens / divisor) * output_cost_per
+            cost = input_cost + output_cost
+            
+            self.total_cost += cost
+            self.cost_by_provider[provider] = self.cost_by_provider.get(provider, 0.0) + cost
+            
+            self.total_tokens_in += input_tokens
+            self.total_tokens_out += output_tokens
+            self.tokens_by_provider[provider] = self.tokens_by_provider.get(provider, 0) + input_tokens + output_tokens
+    
+    def to_json(self) -> str:
+        return json.dumps(asdict(self), indent=2)
+    
+    def save(self, path: Path):
+        path.write_text(self.to_json(), encoding='utf-8')
+    
+    @classmethod
+    def load(cls, path: Path) -> 'MonitorState':
+        if path.exists():
+            try:
+                data = json.loads(path.read_text())
+                return cls(**data)
+            except:
+                pass
+        return cls()
+    
+    def get_summary(self) -> Dict:
+        """Get performance summary"""
+        avg_latency = self.total_latency_ms // max(self.total_calls, 1)
+        
+        provider_stats = {}
+        for p in self.calls_by_provider:
+            calls = self.calls_by_provider.get(p, 0)
+            errors = self.errors_by_provider.get(p, 0)
+            provider_stats[p] = {
+                "calls": calls,
+                "avg_latency_ms": self.latency_by_provider.get(p, 0) // max(calls, 1),
+                "success_rate": (calls - errors) / max(calls, 1),
+                "cost": round(self.cost_by_provider.get(p, 0), 6),
+                "tokens": self.tokens_by_provider.get(p, 0)
+            }
+        
+        return {
+            "total_calls": self.total_calls,
+            "total_latency_ms": self.total_latency_ms,
+            "avg_latency_ms": avg_latency,
+            "total_cost": round(self.total_cost, 6),
+            "total_tokens": self.total_tokens_in + self.total_tokens_out,
+            "by_provider": provider_stats,
+            "last_update": self.last_update
+        }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PROVIDERS REGISTRY WITH COST DATA
+# ══════════════════════════════════════════════════════════════════════════════
+
+PROVIDERS = {
+    # LOCAL
+    "local": {
+        "url": "http://localhost:11434/api/chat",
+        "model": "qwen2.5:7b",
+        "type": "ollama",
+        "role": "fallback",
+        "cost_in": 0.0,
+        "cost_out": 0.0,
+        "requires_key": False,
+        "supports_response_format": False,
+        "cost_unit": "per_token"
+    },
+    
+    # WORKHORSES (cheap/free)
+    "deepseek": {
+        "url": "https://api.deepseek.com/chat/completions",
+        "model": "deepseek-chat",
+        "type": "openai",
+        "role": "coder",
+        "cost_in": 0.00007,
+        "cost_out": 0.00014,
+        "requires_key": True,
+        "supports_response_format": True,
+        "cost_unit": "per_1k"
+    },
+    "groq": {
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "model": "llama-3.1-70b-versatile",
+        "type": "openai",
+        "role": "fast",
+        "cost_in": 0.0,
+        "cost_out": 0.0,
+        "requires_key": True,
+        "supports_response_format": False,
+        "cost_unit": "per_1k"
+    },
+    "sambanova": {
+        "url": "https://api.sambanova.ai/v1/chat/completions",
+        "model": "Meta-Llama-3.1-405B-Instruct",
+        "type": "openai",
+        "role": "heavy",
+        "cost_in": 0.0,
+        "cost_out": 0.0,
+        "requires_key": True,
+        "supports_response_format": True,
+        "cost_unit": "per_1k"
+    },
+    "hyperbolic": {
+        "url": "https://api.hyperbolic.xyz/v1/chat/completions",
+        "model": "meta-llama/Meta-Llama-3.1-70B-Instruct",
+        "type": "openai",
+        "role": "workhorse",
+        "cost_in": 0.0002,
+        "cost_out": 0.0002,
+        "requires_key": True,
+        "supports_response_format": True,
+        "cost_unit": "per_1k"
+    },
+    "together": {
+        "url": "https://api.together.xyz/v1/chat/completions",
+        "model": "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo",
+        "type": "openai",
+        "role": "workhorse",
+        "cost_in": 0.00088,
+        "cost_out": 0.00088,
+        "requires_key": True,
+        "supports_response_format": True,
+        "cost_unit": "per_1k"
+    },
+    "novita": {
+        "url": "https://api.novita.ai/v3/openai/chat/completions",
+        "model": "meta-llama/llama-3.1-70b-instruct",
+        "type": "openai",
+        "role": "workhorse",
+        "cost_in": 0.0002,
+        "cost_out": 0.0002,
+        "requires_key": True,
+        "supports_response_format": True,
+        "cost_unit": "per_1k"
+    },
+    "nebius": {
+        "url": "https://api.studio.nebius.ai/v1/chat/completions",
+        "model": "meta-llama/Meta-Llama-3.1-70B-Instruct",
+        "type": "openai",
+        "role": "workhorse",
+        "cost_in": 0.0002,
+        "cost_out": 0.0002,
+        "requires_key": True,
+        "supports_response_format": True,
+        "cost_unit": "per_1k"
+    },
+    "fireworks": {
+        "url": "https://api.fireworks.ai/inference/v1/chat/completions",
+        "model": "accounts/fireworks/models/llama-v3p1-70b-instruct",
+        "type": "openai",
+        "role": "workhorse",
+        "cost_in": 0.0009,
+        "cost_out": 0.0009,
+        "requires_key": True,
+        "supports_response_format": True,
+        "cost_unit": "per_1k"
+    },
+    "openrouter": {
+        "url": "https://openrouter.ai/api/v1/chat/completions",
+        "model": "meta-llama/llama-3.1-70b-instruct",
+        "type": "openai",
+        "role": "gateway",
+        "cost_in": 0.001,
+        "cost_out": 0.001,
+        "requires_key": True,
+        "supports_response_format": True,
+        "cost_unit": "per_1k"
+    },
+    
+    # SPECIALTY
+    "grok": {
+        "url": "https://api.x.ai/v1/chat/completions",
+        "model": "grok-beta",
+        "type": "openai",
+        "role": "analytics",
+        "cost_in": 0.005,
+        "cost_out": 0.015,
+        "requires_key": True,
+        "supports_response_format": True,
+        "cost_unit": "per_1k"
+    },
+    "perplexity": {
+        "url": "https://api.perplexity.ai/chat/completions",
+        "model": "llama-3.1-sonar-large-128k-online",
+        "type": "openai",
+        "role": "search",
+        "cost_in": 0.001,
+        "cost_out": 0.001,
+        "requires_key": True,
+        "supports_response_format": False,
+        "cost_unit": "per_1k"
+    },
+    "mistral": {
+        "url": "https://api.mistral.ai/v1/chat/completions",
+        "model": "mistral-small-latest",
+        "type": "openai",
+        "role": "format",
+        "cost_in": 0.001,
+        "cost_out": 0.003,
+        "requires_key": True,
+        "supports_response_format": True,
+        "cost_unit": "per_1k"
+    },
+    "skywork": {
+        "url": "https://api.siliconflow.cn/v1/chat/completions",
+        "model": "skywork/skywork-o1-lite",
+        "type": "openai",
+        "role": "reasoning",
+        "cost_in": 0.0,
+        "cost_out": 0.0,
+        "requires_key": True,
+        "supports_response_format": True,
+        "cost_unit": "per_1k"
+    },
+    
+    # PREMIUM
+    "claude": {
+        "url": "https://api.anthropic.com/v1/messages",
+        "model": "claude-3-5-sonnet-20241022",
+        "type": "anthropic",
+        "role": "leader",
+        "cost_in": 0.003,
+        "cost_out": 0.015,
+        "requires_key": True,
+        "supports_response_format": False,
+        "cost_unit": "per_1k"
+    },
+    "openai": {
+        "url": "https://api.openai.com/v1/chat/completions",
+        "model": "gpt-4o",
+        "type": "openai",
+        "role": "premium",
+        "cost_in": 0.005,
+        "cost_out": 0.015,
+        "requires_key": True,
+        "supports_response_format": True,
+        "cost_unit": "per_1k"
+    },
+    "cohere": {
+        "url": "https://api.cohere.ai/v1/chat",
+        "model": "command-r-plus",
+        "type": "cohere",
+        "role": "rag",
+        "cost_in": 0.003,
+        "cost_out": 0.015,
+        "requires_key": True,
+        "supports_response_format": False,
+        "cost_unit": "per_1k"
+    },
+    
+    # SEARCH
+    "serper": {
+        "url": "https://google.serper.dev/search",
+        "type": "search",
+        "role": "search",
+        "cost_in": 0.001,
+        "cost_out": 0.0,
+        "requires_key": True,
+        "supports_response_format": False,
+        "cost_unit": "per_1k"
+    },
+}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HTTP CLIENT
+# ══════════════════════════════════════════════════════════════════════════════
+
+def http_post(url: str, headers: Dict, payload: Dict, timeout: int = 45) -> Tuple[Optional[Dict], Optional[str]]:
+    """
+    Make HTTP POST request
+    Returns: (response_dict, error_string)
+    """
+    data = json.dumps(payload).encode('utf-8')
+    req = urllib.request.Request(url, data=data, headers=headers, method='POST')
+    
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode('utf-8')), None
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()[:500] if e.fp else ""
+        return None, f"HTTP {e.code}: {body}"
+    except urllib.error.URLError as e:
+        return None, f"Connection error: {e.reason}"
+    except socket.timeout:
+        return None, "Timeout"
+    except Exception as e:
+        return None, str(e)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CIRCUIT BREAKER
+# ══════════════════════════════════════════════════════════════════════════════
+
+class CircuitBreaker:
+    """Prevent calling failing providers repeatedly"""
+    
+    def __init__(self, failure_threshold: int = 3, reset_timeout: int = 300):
+        self.failure_threshold = failure_threshold
+        self.reset_timeout = reset_timeout
+        self.failures: Dict[str, List[float]] = {}
+        self.state: Dict[str, str] = {}
+        self.last_reset: Dict[str, float] = {}
+    
+    def can_call(self, provider: str) -> bool:
+        """Check if provider can be called"""
+        now = time.time()
+        
+        if provider not in self.failures:
+            self.state[provider] = "closed"
+            return True
+        
+        if self.state.get(provider) == "open":
+            if now - self.last_reset.get(provider, 0) > self.reset_timeout:
+                self.state[provider] = "half-open"
+                return True
+            return False
+        
+        if self.state.get(provider) == "half-open":
+            return True
+        
+        failures = self.failures[provider]
+        recent_failures = [f for f in failures if now - f < 60]
+        
+        if len(recent_failures) >= self.failure_threshold:
+            self.state[provider] = "open"
+            self.last_reset[provider] = now
+            return False
+        
+        return True
+    
+    def record_success(self, provider: str):
+        """Record successful call"""
+        if provider in self.failures:
+            self.failures[provider] = []
+            self.state[provider] = "closed"
+    
+    def record_failure(self, provider: str):
+        """Record failed call"""
+        if provider not in self.failures:
+            self.failures[provider] = []
+        
+        self.failures[provider].append(time.time())
+        
+        now = time.time()
+        self.failures[provider] = [f for f in self.failures[provider] if now - f < 300]
+        
+        if len(self.failures[provider]) >= self.failure_threshold:
+            self.state[provider] = "open"
+            self.last_reset[provider] = now
+    
+    def get_status(self) -> Dict[str, str]:
+        """Get circuit state for all providers"""
+        return dict(self.state)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ENHANCED PROVIDER CALLER WITH MAX_TOKENS
+# ══════════════════════════════════════════════════════════════════════════════
+
+class Caller:
+    """Unified provider calling interface with circuit breaker"""
+    
+    # Role to provider priority chains
+    ROLE_CHAINS = {
+        "planner": [
+            ["deepseek", "claude", "grok"],
+            ["groq", "openai", "together"],
+            ["mistral", "fireworks", "nebius"],
+            ["local"]
+        ],
+        "coder": [
+            ["deepseek", "groq", "claude"],
+            ["openai", "together", "fireworks"],
+            ["mistral", "sambanova", "hyperbolic"],
+            ["local"]
+        ],
+        "critic": [
+            ["grok", "claude", "deepseek"],
+            ["openai", "groq", "together"],
+            ["mistral", "fireworks", "nebius"],
+            ["local"]
+        ],
+        "search": [
+            ["perplexity", "serper"],
+            ["grok", "claude"],
+            ["deepseek", "groq"],
+        ],
+        "synthesizer": [
+            ["claude", "grok", "deepseek"],
+            ["openai", "groq", "together"],
+            ["mistral", "fireworks"],
+            ["local"]
+        ],
+        "fallback": [
+            ["local"],
+            ["groq", "deepseek"],
+            ["together", "fireworks"]
+        ]
+    }
+    
+    def __init__(self, config: Config, monitor: MonitorState):
+        self.config = config
+        self.monitor = monitor
+        self.circuit_breaker = CircuitBreaker(
+            failure_threshold=config.CIRCUIT_FAILURE_THRESHOLD,
+            reset_timeout=config.CIRCUIT_RESET_TIMEOUT
+        )
+    
+    def check_ollama(self) -> bool:
+        """Check if local Ollama is running"""
+        try:
+            req = urllib.request.Request("http://localhost:11434/api/tags")
+            with urllib.request.urlopen(req, timeout=2):
+                return True
+        except:
+            return False
+    
+    def elect(self, role: str, exclude: List[str] = None) -> Optional[str]:
+        """Find best available provider for a role with fallback strategy"""
+        exclude = exclude or []
+        candidates_chains = self.ROLE_CHAINS.get(role, self.ROLE_CHAINS["fallback"])
+        
+        for chain in candidates_chains:
+            for provider in chain:
+                if provider in exclude:
+                    continue
+                
+                # Check circuit breaker first
+                if self.config.ENABLE_CIRCUIT_BREAKER and not self.circuit_breaker.can_call(provider):
+                    continue
+                
+                # Check authentication/availability
+                if provider == "local":
+                    if self.check_ollama():
+                        return provider
+                    continue
+                
+                # Check if provider has auth (key if required)
+                if has_auth(provider):
+                    return provider
+        
+        return None
+    
+    def call(self, provider: str, prompt: str, system: str = None, json_mode: bool = False) -> Tuple[Optional[str], Dict]:
+        """Call a provider with circuit breaker protection"""
+        # Check circuit breaker first
+        if not self.circuit_breaker.can_call(provider):
+            return None, {"error": f"Circuit breaker open for {provider}", "latency_ms": 0}
+        
+        cfg = PROVIDERS.get(provider)
+        if not cfg:
+            return None, {"error": f"Unknown provider: {provider}", "latency_ms": 0}
+        
+        ptype = cfg.get("type")
+        start = time.time()
+        
+        # Estimate input tokens
+        input_text = (system or "") + prompt
+        input_tokens = estimate_tokens(input_text, ptype)
+        
+        # ── OLLAMA ──
+        if ptype == "ollama":
+            if not self.check_ollama():
+                return None, {"error": "Ollama offline", "latency_ms": 0}
+            
+            msgs = [{"role": "user", "content": prompt}]
+            if system:
+                msgs.insert(0, {"role": "system", "content": system})
+            
+            # Use provider-specific overrides if available
+            timeout = cfg.get("timeout_override", 120)
+            
+            result, err = http_post(
+                cfg["url"],
+                {"Content-Type": "application/json"},
+                {"model": cfg["model"], "messages": msgs, "stream": False},
+                timeout=timeout
+            )
+            
+            latency = int((time.time() - start) * 1000)
+            
+            if err:
+                self.circuit_breaker.record_failure(provider)
+                self.monitor.record_call(provider, latency, False, input_tokens, 0)
+                return None, {"error": err, "latency_ms": latency}
+            
+            output, parse_error = parse_response(ptype, result)
+            if output is not None:
+                output_tokens = estimate_tokens(output, ptype)
+                self.circuit_breaker.record_success(provider)
+                self.monitor.record_call(provider, latency, True, input_tokens, output_tokens)
+                return output, {
+                    "provider": provider,
+                    "latency_ms": latency,
+                    "tokens_in": input_tokens,
+                    "tokens_out": output_tokens
+                }
+            
+            error_msg = parse_error or "Unexpected response"
+            self.circuit_breaker.record_failure(provider)
+            self.monitor.record_call(provider, latency, False, input_tokens, 0)
+            return None, {"error": error_msg, "latency_ms": latency}
+        
+        # ── ANTHROPIC ──
+        if ptype == "anthropic":
+            if not has_key("anthropic") and not has_key("claude"):
+                return None, {"error": "No API key for anthropic/claude", "latency_ms": 0}
+            
+            headers = {
+                "x-api-key": KEYS.get("anthropic") or KEYS.get("claude"),
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json"
+            }
+            
+            # Use provider-specific overrides if available
+            max_tokens = cfg.get("max_tokens_override", self.config.MAX_TOKENS)
+            timeout = cfg.get("timeout_override", self.config.TIMEOUT)
+            
+            payload = {
+                "model": cfg["model"],
+                "max_tokens": max_tokens,
+                "messages": [{"role": "user", "content": prompt}]
+            }
+            if system:
+                payload["system"] = system
+            
+            # Anthropic doesn't support json_mode via API, rely on prompt
+            if json_mode:
+                prompt = f"Respond with valid JSON only. No other text.\n\n{prompt}"
+                payload["messages"][0]["content"] = prompt
+            
+            result, err = http_post(cfg["url"], headers, payload, timeout)
+            latency = int((time.time() - start) * 1000)
+            
+            if err:
+                self.circuit_breaker.record_failure(provider)
+                self.monitor.record_call(provider, latency, False, input_tokens, 0)
+                return None, {"error": err, "latency_ms": latency}
+            
+            output, parse_error = _extract_anthropic_text(result)
+            if output is not None:
+                output_tokens = estimate_tokens(output, ptype)
+                self.circuit_breaker.record_success(provider)
+                self.monitor.record_call(provider, latency, True, input_tokens, output_tokens)
+                return output, {
+                    "provider": provider,
+                    "latency_ms": latency,
+                    "tokens_in": input_tokens,
+                    "tokens_out": output_tokens
+                }
+            
+            error_msg = parse_error or "Unexpected response"
+            self.circuit_breaker.record_failure(provider)
+            self.monitor.record_call(provider, latency, False, input_tokens, 0)
+            return None, {"error": error_msg, "latency_ms": latency}
+        
+        # ── COHERE ──
+        if ptype == "cohere":
+            if not has_key("cohere"):
+                return None, {"error": "No API key for cohere", "latency_ms": 0}
+            
+            headers = {
+                "Authorization": f"Bearer {KEYS['cohere']}",
+                "Content-Type": "application/json"
+            }
+            
+            # Use provider-specific overrides if available
+            max_tokens = cfg.get("max_tokens_override", self.config.MAX_TOKENS)
+            timeout = cfg.get("timeout_override", self.config.TIMEOUT)
+            
+            payload = {
+                "model": cfg["model"],
+                "message": prompt,
+                "max_tokens": max_tokens
+            }
+            if system:
+                payload["preamble"] = system
+            
+            # Cohere doesn't support json_mode, rely on prompt
+            if json_mode:
+                prompt = f"Respond with valid JSON only. No other text.\n\n{prompt}"
+                payload["message"] = prompt
+            
+            result, err = http_post(cfg["url"], headers, payload, timeout)
+            latency = int((time.time() - start) * 1000)
+            
+            if err:
+                self.circuit_breaker.record_failure(provider)
+                self.monitor.record_call(provider, latency, False, input_tokens, 0)
+                return None, {"error": err, "latency_ms": latency}
+            
+            output, parse_error = _extract_cohere_text(result)
+            if output is not None:
+                output_tokens = estimate_tokens(output, ptype)
+                self.circuit_breaker.record_success(provider)
+                self.monitor.record_call(provider, latency, True, input_tokens, output_tokens)
+                return output, {
+                    "provider": provider,
+                    "latency_ms": latency,
+                    "tokens_in": input_tokens,
+                    "tokens_out": output_tokens
+                }
+            
+            error_msg = parse_error or "Unexpected response"
+            self.circuit_breaker.record_failure(provider)
+            self.monitor.record_call(provider, latency, False, input_tokens, 0)
+            return None, {"error": error_msg, "latency_ms": latency}
+        
+        # ── OPENAI-COMPATIBLE ──
+        if ptype == "openai":
+            if not has_key(provider):
+                return None, {"error": f"No API key for {provider}", "latency_ms": 0}
+            
+            headers = {
+                "Authorization": f"Bearer {KEYS[provider]}",
+                "Content-Type": "application/json"
+            }
+            
+            # Apply JSON instruction before building messages
+            effective_prompt = prompt
+            if json_mode and not cfg.get("supports_response_format", False):
+                effective_prompt = f"Respond with valid JSON only. No other text.\n\n{prompt}"
+            
+            msgs = []
+            if system:
+                msgs.append({"role": "system", "content": system})
+            msgs.append({"role": "user", "content": effective_prompt})
+            
+            # Use provider-specific overrides if available
+            max_tokens = cfg.get("max_tokens_override", self.config.MAX_TOKENS)
+            timeout = cfg.get("timeout_override", self.config.TIMEOUT)
+            
+            payload = {
+                "model": cfg["model"],
+                "messages": msgs,
+                "temperature": 0.3,
+                "max_tokens": max_tokens
+            }
+            
+            # Only use response_format for providers that explicitly support it
+            if json_mode and cfg.get("supports_response_format", False):
+                payload["response_format"] = {"type": "json_object"}
+            
+            result, err = http_post(cfg["url"], headers, payload, timeout)
+            latency = int((time.time() - start) * 1000)
+            
+            if err:
+                self.circuit_breaker.record_failure(provider)
+                self.monitor.record_call(provider, latency, False, input_tokens, 0)
+                return None, {"error": err, "latency_ms": latency}
+            
+            output, parse_error = _extract_openai_text(result)
+            if output is not None:
+                output_tokens = estimate_tokens(output, ptype)
+                self.circuit_breaker.record_success(provider)
+                self.monitor.record_call(provider, latency, True, input_tokens, output_tokens)
+                return output, {
+                    "provider": provider,
+                    "latency_ms": latency,
+                    "tokens_in": input_tokens,
+                    "tokens_out": output_tokens
+                }
+            
+            error_msg = parse_error or "Unexpected response format"
+            self.circuit_breaker.record_failure(provider)
+            self.monitor.record_call(provider, latency, False, input_tokens, 0)
+            return None, {"error": error_msg, "latency_ms": latency}
+        
+        # ── SEARCH ──
+        if ptype == "search":
+            if provider == "serper" and has_key("serper"):
+                headers = {
+                    "X-API-KEY": KEYS["serper"],
+                    "Content-Type": "application/json"
+                }
+                result, err = http_post(cfg["url"], headers, {"q": prompt, "num": 5}, self.config.TIMEOUT)
+                latency = int((time.time() - start) * 1000)
+                
+                if err:
+                    self.circuit_breaker.record_failure(provider)
+                    self.monitor.record_call(provider, latency, False, input_tokens, 0)
+                    return None, {"error": err, "latency_ms": latency}
+                
+                if result and "organic" in result:
+                    snippets = [f"• {r['title']}: {r['snippet']}" for r in result["organic"][:5]]
+                    output = "\n".join(snippets)
+                    output_tokens = estimate_tokens(output, ptype)
+                    self.circuit_breaker.record_success(provider)
+                    self.monitor.record_call(provider, latency, True, input_tokens, output_tokens)
+                    return output, {
+                        "provider": provider,
+                        "latency_ms": latency,
+                        "tokens_in": input_tokens,
+                        "tokens_out": output_tokens
+                    }
+            
+            return None, {"error": "Search failed", "latency_ms": 0}
+        
+        return None, {"error": f"Unknown provider type: {ptype}", "latency_ms": 0}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BATCH CALLER
+# ══════════════════════════════════════════════════════════════════════════════
+
+class BatchCaller:
+    """Batch API calls for efficiency"""
+    
+    def __init__(self, config: Config, monitor: MonitorState):
+        self.config = config
+        self.monitor = monitor
+        self.circuit_breaker = CircuitBreaker()
+    
+    def check_ollama(self) -> bool:
+        """Check if local Ollama is running"""
+        try:
+            req = urllib.request.Request("http://localhost:11434/api/tags")
+            with urllib.request.urlopen(req, timeout=2):
+                return True
+        except:
+            return False
+    
+    def _make_single_call(self, provider: str, prompt: str, system: str = None) -> Tuple[Optional[str], Dict]:
+        """Make single API call - simplified for batch processing"""
+        if not self.circuit_breaker.can_call(provider):
+            return None, {"error": f"Circuit breaker open for {provider}", "latency_ms": 0}
+        
+        cfg = PROVIDERS.get(provider)
+        if not cfg:
+            return None, {"error": f"Unknown provider: {provider}", "latency_ms": 0}
+        
+        ptype = cfg.get("type")
+        start = time.time()
+        
+        # Estimate tokens
+        input_tokens = estimate_tokens(prompt, ptype)
+        if system:
+            input_tokens += estimate_tokens(system, ptype)
+        
+        try:
+            if ptype == "openai" and has_key(provider):
+                headers = {"Authorization": f"Bearer {KEYS[provider]}", "Content-Type": "application/json"}
+                msgs = []
+                if system:
+                    msgs.append({"role": "system", "content": system})
+                msgs.append({"role": "user", "content": prompt})
+                
+                payload = {"model": cfg["model"], "messages": msgs, "temperature": 0.3}
+                
+                result, err = http_post(cfg["url"], headers, payload, self.config.TIMEOUT)
+                latency = int((time.time() - start) * 1000)
+                
+                if err:
+                    self.circuit_breaker.record_failure(provider)
+                    self.monitor.record_call(provider, latency, False, input_tokens, 0)
+                    return None, {"error": err, "latency_ms": latency}
+                
+                output, parse_error = _extract_openai_text(result)
+                if output is not None:
+                    output_tokens = estimate_tokens(output, ptype)
+                    self.circuit_breaker.record_success(provider)
+                    self.monitor.record_call(provider, latency, True, input_tokens, output_tokens)
+                    return output, {"provider": provider, "latency_ms": latency}
+                
+                error_msg = parse_error or "Unexpected response"
+                self.circuit_breaker.record_failure(provider)
+                return None, {"error": error_msg, "latency_ms": latency}
+            
+            self.circuit_breaker.record_failure(provider)
+            return None, {"error": "Provider not supported in batch mode", "latency_ms": 0}
+            
+        except Exception as e:
+            self.circuit_breaker.record_failure(provider)
+            latency = int((time.time() - start) * 1000)
+            self.monitor.record_call(provider, latency, False, input_tokens, 0)
+            return None, {"error": str(e), "latency_ms": latency}
+    
+    def batch_call(self, calls: List[Tuple[str, str, Optional[str]]]) -> List[Tuple[Optional[str], Dict]]:
+        """
+        Batch multiple API calls efficiently
+        Each call: (provider, prompt, system)
+        """
+        results = []
+        
+        for provider, prompt, system in calls:
+            result = self._make_single_call(provider, prompt, system)
+            results.append(result)
+        
+        return results
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# WORKFLOW TEMPLATES
+# ══════════════════════════════════════════════════════════════════════════════
+
+class WorkflowTemplate:
+    """Predefined workflow templates for common tasks"""
+    
+    TEMPLATES = {
+        "code_review": {
+            "description": "Comprehensive code review with multiple perspectives",
+            "phases": [
+                {
+                    "role": "planner",
+                    "system": "Analyze this code for architecture, patterns, and potential issues. Create a structured review plan.",
+                    "output_format": "json"
+                },
+                {
+                    "role": "critic", 
+                    "system": "Conduct a detailed code review. Find bugs, security vulnerabilities, performance issues, and style violations.",
+                    "output_format": "markdown"
+                },
+                {
+                    "role": "coder",
+                    "system": "Provide corrected code with detailed explanations of changes. Include both fixes and improvements.",
+                    "output_format": "code"
+                }
+            ],
+            "providers": ["deepseek", "grok", "claude"],
+            "timeout": 180
+        },
+        "research_report": {
+            "description": "Research and synthesize information into a structured report",
+            "phases": [
+                {
+                    "role": "search",
+                    "system": "Research the topic thoroughly. Gather relevant information, sources, and key points.",
+                    "output_format": "markdown"
+                },
+                {
+                    "role": "synthesizer",
+                    "system": "Synthesize the research into a coherent, well-structured report with clear sections.",
+                    "output_format": "markdown"
+                },
+                {
+                    "role": "critic",
+                    "system": "Review the report for clarity, accuracy, completeness, and professional presentation.",
+                    "output_format": "markdown"
+                }
+            ],
+            "providers": ["perplexity", "claude", "grok"],
+            "timeout": 240
+        },
+        "api_design": {
+            "description": "Design and document a REST API",
+            "phases": [
+                {
+                    "role": "planner",
+                    "system": "Design the API architecture, endpoints, data models, and authentication strategy.",
+                    "output_format": "json"
+                },
+                {
+                    "role": "coder",
+                    "system": "Generate OpenAPI/Swagger specification and example implementation code.",
+                    "output_format": "yaml"
+                },
+                {
+                    "role": "critic",
+                    "system": "Review the API design for RESTful principles, security, scalability, and developer experience.",
+                    "output_format": "markdown"
+                }
+            ],
+            "providers": ["claude", "deepseek", "grok"],
+            "timeout": 200
+        },
+        "data_analysis": {
+            "description": "Analyze data and generate insights",
+            "phases": [
+                {
+                    "role": "planner",
+                    "system": "Plan the analysis approach: what questions to answer, what methods to use, what outputs to generate.",
+                    "output_format": "json"
+                },
+                {
+                    "role": "coder",
+                    "system": "Write Python code for data cleaning, analysis, and visualization using pandas/matplotlib.",
+                    "output_format": "code"
+                },
+                {
+                    "role": "synthesizer",
+                    "system": "Interpret the results, generate insights, and create a summary report.",
+                    "output_format": "markdown"
+                }
+            ],
+            "providers": ["deepseek", "claude", "grok"],
+            "timeout": 220
+        }
+    }
+    
+    @classmethod
+    def get_template(cls, name: str) -> Optional[Dict]:
+        """Get a workflow template by name"""
+        return cls.TEMPLATES.get(name)
+    
+    @classmethod
+    def list_templates(cls) -> List[Dict]:
+        """List all available templates"""
+        return [
+            {"name": name, "description": data["description"]}
+            for name, data in cls.TEMPLATES.items()
+        ]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PERFORMANCE DASHBOARD
+# ══════════════════════════════════════════════════════════════════════════════
+
+class PerformanceDashboard:
+    """Generate performance reports and analytics"""
+    
+    def __init__(self, monitor: MonitorState, config: Config):
+        self.monitor = monitor
+        self.config = config
+    
+    def generate_report(self, format: str = "markdown") -> str:
+        """Generate comprehensive performance report"""
+        summary = self.monitor.get_summary()
+        
+        if format == "markdown":
+            return self._generate_markdown_report(summary)
+        elif format == "html":
+            return self._generate_html_report(summary)
+        elif format == "json":
+            return json.dumps(summary, indent=2)
+        elif format == "text":
+            return self._generate_text_report(summary)
+        else:
+            return str(summary)
+    
+    def _generate_markdown_report(self, summary: Dict) -> str:
+        """Generate markdown report"""
+        report = [
+            "# COG System Performance Report",
+            f"**Generated**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            f"**Last Update**: {summary.get('last_update', 'N/A')}",
+            "",
+            "## Summary",
+            f"- **Total Calls**: {summary['total_calls']:,}",
+            f"- **Total Latency**: {summary['total_latency_ms']:,}ms",
+            f"- **Average Latency**: {summary['avg_latency_ms']:,}ms",
+            f"- **Total Cost**: ${summary['total_cost']:.6f}",
+            f"- **Total Tokens**: {summary['total_tokens']:,}",
+            "",
+            "## Provider Performance",
+            "| Provider | Calls | Avg Latency | Success Rate | Cost | Tokens |",
+            "|----------|-------|-------------|--------------|------|--------|"
+        ]
+        
+        for provider, stats in summary.get("by_provider", {}).items():
+            report.append(
+                f"| {provider} | {stats['calls']:,} | {stats['avg_latency_ms']}ms | "
+                f"{stats['success_rate']:.1%} | ${stats['cost']:.6f} | {stats['tokens']:,} |"
+            )
+        
+        # Add recommendations
+        report.extend([
+            "",
+            "## Recommendations",
+            self._generate_recommendations(summary)
+        ])
+        
+        return "\n".join(report)
+    
+    def _generate_text_report(self, summary: Dict) -> str:
+        """Generate plain text report for CLI"""
+        lines = [
+            "=" * 60,
+            "COG PERFORMANCE REPORT",
+            "=" * 60,
+            f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            f"Last Update: {summary.get('last_update', 'N/A')}",
+            "",
+            "SUMMARY:",
+            f"  Total Calls: {summary['total_calls']:,}",
+            f"  Total Latency: {summary['total_latency_ms']:,}ms",
+            f"  Average Latency: {summary['avg_latency_ms']:,}ms",
+            f"  Total Cost: ${summary['total_cost']:.6f}",
+            f"  Total Tokens: {summary['total_tokens']:,}",
+            "",
+            "PROVIDER PERFORMANCE:",
+        ]
+        
+        for provider, stats in summary.get("by_provider", {}).items():
+            lines.append(
+                f"  {provider:12} | Calls: {stats['calls']:4} | "
+                f"Latency: {stats['avg_latency_ms']:4}ms | "
+                f"Success: {stats['success_rate']:.1%} | "
+                f"Cost: ${stats['cost']:.6f}"
+            )
+        
+        lines.append("")
+        lines.append("RECOMMENDATIONS:")
+        for rec in self._generate_recommendations(summary).split("\n"):
+            lines.append(f"  {rec}")
+        
+        return "\n".join(lines)
+    
+    def _generate_recommendations(self, summary: Dict) -> str:
+        """Generate actionable recommendations"""
+        recommendations = []
+        
+        by_provider = summary.get("by_provider", {})
+        
+        # Find fastest provider
+        if by_provider:
+            fastest = min(by_provider.items(), key=lambda x: x[1]["avg_latency_ms"])
+            if fastest[1]["calls"] > 5:
+                recommendations.append(f"**Fastest Provider**: {fastest[0]} ({fastest[1]['avg_latency_ms']}ms avg latency)")
+        
+        # Find cheapest provider (cost per call)
+        if by_provider:
+            cost_per_call = {}
+            for p, stats in by_provider.items():
+                if stats["calls"] > 0:
+                    cost_per_call[p] = stats["cost"] / stats["calls"]
+            
+            if cost_per_call:
+                cheapest = min(cost_per_call.items(), key=lambda x: x[1])
+                if cheapest[1] > 0:
+                    recommendations.append(f"**Most Cost-Effective**: {cheapest[0]} (${cheapest[1]:.6f} per call)")
+        
+        # Identify problematic providers
+        problematic = [
+            p for p, stats in by_provider.items()
+            if stats.get("success_rate", 1) < 0.7 and stats.get("calls", 0) > 5
+        ]
+        if problematic:
+            recommendations.append(f"**Needs Attention**: {', '.join(problematic)} have success rate < 70%")
+        
+        # Cost saving recommendations
+        total_cost = summary.get("total_cost", 0)
+        if total_cost > 0.50:  # More than 50 cents spent
+            recommendations.append(
+                f"**Cost Alert**: Total cost is ${total_cost:.2f}. "
+                "Consider using cheaper providers (deepseek, groq) for non-critical tasks."
+            )
+        
+        if not recommendations:
+            return "All systems are operating optimally."
+        
+        return "\n".join([f"- {r}" for r in recommendations])
+    
+    def _generate_html_report(self, summary: Dict) -> str:
+        """Generate HTML report (simplified)"""
+        html = f"""
+        <html>
+        <head>
+            <title>COG Performance Report</title>
+            <style>
+                body {{ font-family: Arial, sans-serif; margin: 40px; }}
+                h1 {{ color: #333; }}
+                table {{ border-collapse: collapse; width: 100%; margin: 20px 0; }}
+                th, td {{ border: 1px solid #ddd; padding: 12px; text-align: left; }}
+                th {{ background-color: #f4f4f4; }}
+                .good {{ color: green; }}
+                .warning {{ color: orange; }}
+                .bad {{ color: red; }}
+            </style>
+        </head>
+        <body>
+            <h1>COG System Performance Report</h1>
+            <p><strong>Generated:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+            <p><strong>Last Update:</strong> {summary.get('last_update', 'N/A')}</p>
+            
+            <h2>Summary</h2>
+            <ul>
+                <li><strong>Total Calls:</strong> {summary['total_calls']:,}</li>
+                <li><strong>Total Latency:</strong> {summary['total_latency_ms']:,}ms</li>
+                <li><strong>Average Latency:</strong> {summary['avg_latency_ms']:,}ms</li>
+                <li><strong>Total Cost:</strong> ${summary['total_cost']:.6f}</li>
+                <li><strong>Total Tokens:</strong> {summary['total_tokens']:,}</li>
+            </ul>
+            
+            <h2>Provider Performance</h2>
+            <table>
+                <tr>
+                    <th>Provider</th>
+                    <th>Calls</th>
+                    <th>Avg Latency</th>
+                    <th>Success Rate</th>
+                    <th>Cost</th>
+                    <th>Tokens</th>
+                </tr>
+        """
+        
+        for provider, stats in summary.get("by_provider", {}).items():
+            success_class = "good" if stats["success_rate"] > 0.9 else "warning" if stats["success_rate"] > 0.7 else "bad"
+            html += f"""
+                <tr>
+                    <td>{provider}</td>
+                    <td>{stats['calls']:,}</td>
+                    <td>{stats['avg_latency_ms']}ms</td>
+                    <td class="{success_class}">{stats['success_rate']:.1%}</td>
+                    <td>${stats['cost']:.6f}</td>
+                    <td>{stats['tokens']:,}</td>
+                </tr>
+            """
+        
+        html += f"""
+            </table>
+            
+            <h2>Recommendations</h2>
+            <ul>
+        """
+        
+        for rec in self._generate_recommendations(summary).split("\n"):
+            if rec.strip():
+                html += f"<li>{rec.strip().replace('**', '')}</li>"
+        
+        html += """
+            </ul>
+        </body>
+        </html>
+        """
+        return html
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 4-PHASE REASONING ENGINE
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ReasoningEngine:
+    """
+    Implements the 4-Phase Constrained Reasoning Loop:
+    
+    Phase 1: DIVERGENT PLANNING (Tree-of-Thought)
+        - Generate 3 distinct approaches
+        - Identify risks for each
+    
+    Phase 2: CRITIQUE (Self-Correction)
+        - Select best approach
+        - Identify flaws, refine
+    
+    Phase 3: EXECUTE (Chain-of-Thought)
+        - Run the selected approach
+        - Track execution steps
+    
+    Phase 4: OUTPUT (Artifact)
+        - Clean final result
+        - JSON structured output
+    """
+    
+    def __init__(self, config: Config, caller: Caller):
+        self.config = config
+        self.caller = caller
+    
+    def run(self, task: str, workflow: str = "code", output_format: str = "text") -> ReasoningResult:
+        """
+        Execute full 4-phase reasoning loop
+        """
+        result = ReasoningResult(
+            task_id=str(uuid.uuid4())[:8],
+            timestamp=datetime.now().isoformat(),
+            output_format=output_format
+        )
+        
+        total_start = time.time()
+        
+        try:
+            # ── PHASE 1: DIVERGENT PLANNING ──
+            branches = self._phase_plan(task, workflow, result)
+            if not branches:
+                result.status = "failed"
+                result.error = "Planning phase failed"
+                return result
+            result.branches = branches
+            
+            # ── PHASE 2: CRITIQUE ──
+            selected, critique, refinements = self._phase_critique(task, branches, result)
+            result.selected_branch = selected
+            result.critique = critique
+            result.refinements = refinements
+            
+            # ── PHASE 3: EXECUTE ──
+            execution_output = self._phase_execute(task, branches[selected], refinements, workflow, result)
+            if execution_output is None:
+                result.status = "failed"
+                result.error = "Execution phase failed"
+                return result
+            
+            # ── PHASE 4: OUTPUT ──
+            final = self._phase_output(task, execution_output, output_format, result)
+            result.final_output = final
+            result.status = "complete"
+            
+        except Exception as e:
+            result.status = "failed"
+            result.error = str(e)
+        
+        result.total_latency_ms = int((time.time() - total_start) * 1000)
+        
+        # Save result
+        artifact_path = self.config.ARTIFACTS / f"{result.task_id}_{workflow}.json"
+        result.save(artifact_path)
+        
+        return result
+    
+    def _phase_plan(self, task: str, workflow: str, result: ReasoningResult) -> List[ReasoningBranch]:
+        """Phase 1: Generate 3 divergent approaches"""
+        
+        provider = self.caller.elect("planner")
+        if not provider:
+            return []
+        
+        result.providers_used.append(provider)
+        
+        system = """You are a strategic planner. Generate exactly 3 distinct approaches to the task.
+
+OUTPUT FORMAT (JSON only, no other text):
+{
+    "approaches": [
+        {"approach": "Description of approach 1", "risk": "Main risk or failure point"},
+        {"approach": "Description of approach 2", "risk": "Main risk or failure point"},
+        {"approach": "Description of approach 3", "risk": "Main risk or failure point"}
+    ]
+}"""
+        
+        prompt = f"TASK: {task}\n\nGenerate 3 approaches with risks. JSON only."
+        
+        response, meta = self.caller.call(provider, prompt, system, json_mode=True)
+        result.execution_log.append({
+            "phase": "plan",
+            "provider": provider,
+            "latency_ms": meta.get("latency_ms", 0),
+            "success": response is not None,
+            "tokens_in": meta.get("tokens_in", 0),
+            "tokens_out": meta.get("tokens_out", 0)
+        })
+        
+        if not response:
+            return []
+        
+        # Parse JSON response
+        try:
+            # Try to extract JSON from response
+            text = response.strip()
+            if text.startswith("```"):
+                text = text.split("```")[1]
+                if text.startswith("json"):
+                    text = text[4:]
+            
+            data = json.loads(text)
+            branches = []
+            for a in data.get("approaches", [])[:3]:
+                branches.append(ReasoningBranch(
+                    approach=a.get("approach", ""),
+                    risk=a.get("risk", "")
+                ))
+            return branches if len(branches) == 3 else []
+        except:
+            return []
+    
+    def _phase_critique(self, task: str, branches: List[ReasoningBranch], result: ReasoningResult) -> Tuple[int, str, List[str]]:
+        """Phase 2: Critique and select best approach"""
+        
+        provider = self.caller.elect("critic", exclude=[result.providers_used[-1]] if result.providers_used else [])
+        if not provider:
+            provider = result.providers_used[-1] if result.providers_used else "deepseek"
+        
+        result.providers_used.append(provider)
+        
+        branches_text = "\n".join([
+            f"APPROACH {i+1}: {b.approach}\n  RISK: {b.risk}"
+            for i, b in enumerate(branches)
+        ])
+        
+        system = """You are a critical analyst. Review the approaches and select the best one.
+
+OUTPUT FORMAT (JSON only):
+{
+    "selected": 1,
+    "rationale": "Why this approach is best",
+    "refinements": ["Specific improvement 1", "Specific improvement 2"]
+}"""
+        
+        prompt = f"""TASK: {task}
+
+{branches_text}
+
+Select the best approach (1, 2, or 3). Provide refinements. JSON only."""
+        
+        response, meta = self.caller.call(provider, prompt, system, json_mode=True)
+        result.execution_log.append({
+            "phase": "critique",
+            "provider": provider,
+            "latency_ms": meta.get("latency_ms", 0),
+            "success": response is not None,
+            "tokens_in": meta.get("tokens_in", 0),
+            "tokens_out": meta.get("tokens_out", 0)
+        })
+        
+        if not response:
+            return 0, "Critique failed", []
+        
+        try:
+            text = response.strip()
+            if text.startswith("```"):
+                text = text.split("```")[1]
+                if text.startswith("json"):
+                    text = text[4:]
+            
+            data = json.loads(text)
+            selected = int(data.get("selected", 1)) - 1
+            selected = max(0, min(2, selected))
+            critique = data.get("rationale", "")
+            refinements = data.get("refinements", [])
+            return selected, critique, refinements
+        except:
+            return 0, "Parse failed", []
+    
+    def _phase_execute(self, task: str, branch: ReasoningBranch, refinements: List[str], workflow: str, result: ReasoningResult) -> Optional[str]:
+        """Phase 3: Execute the selected approach"""
+        
+        provider = self.caller.elect("coder" if workflow == "code" else "synthesizer")
+        if not provider:
+            return None
+        
+        result.providers_used.append(provider)
+        
+        refinements_text = "\n".join([f"- {r}" for r in refinements]) if refinements else "None"
+        
+        system_prompts = {
+            "code": "You are an expert programmer. Write clean, working code. Include comments. No explanations outside code blocks.",
+            "research": "You are a research analyst. Synthesize information clearly. Cite reasoning.",
+            "format": "You are a document formatter. Structure content professionally.",
+            "default": "You are a helpful assistant. Complete the task thoroughly."
+        }
+        
+        system = system_prompts.get(workflow, system_prompts["default"])
+        
+        prompt = f"""TASK: {task}
+
+SELECTED APPROACH: {branch.approach}
+
+REFINEMENTS TO APPLY:
+{refinements_text}
+
+Execute this approach now. Provide complete output."""
+        
+        response, meta = self.caller.call(provider, prompt, system)
+        result.execution_log.append({
+            "phase": "execute",
+            "provider": provider,
+            "latency_ms": meta.get("latency_ms", 0),
+            "success": response is not None,
+            "tokens_in": meta.get("tokens_in", 0),
+            "tokens_out": meta.get("tokens_out", 0)
+        })
+        
+        return response
+    
+    def _phase_output(self, task: str, execution: str, output_format: str, result: ReasoningResult) -> str:
+        """Phase 4: Clean and format final output"""
+        
+        if output_format == "raw":
+            return execution
+        
+        if output_format == "json":
+            # Try to extract/wrap as JSON
+            try:
+                # If already valid JSON, return it
+                json.loads(execution)
+                return execution
+            except:
+                # Wrap in JSON structure
+                return json.dumps({
+                    "task": task,
+                    "result": execution,
+                    "timestamp": result.timestamp
+                }, indent=2)
+        
+        if output_format == "code":
+            # Extract code blocks if present
+            if "```" in execution:
+                blocks = []
+                in_block = False
+                current = []
+                for line in execution.split("\n"):
+                    if line.startswith("```"):
+                        if in_block:
+                            blocks.append("\n".join(current))
+                            current = []
+                        in_block = not in_block
+                    elif in_block:
+                        current.append(line)
+                return "\n\n".join(blocks) if blocks else execution
+        
+        return execution
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SIMPLE RAG
+# ══════════════════════════════════════════════════════════════════════════════
+
+class SimpleRAG:
+    """Lightweight keyword-based RAG for context injection"""
+    
+    def __init__(self, config: Config):
+        self.config = config
+    
+    def search(self, query: str, max_results: int = 3) -> List[Dict]:
+        """Search chunks for relevant content"""
+        if not self.config.RAG_CHUNKS.exists():
+            return []
+        
+        keywords = [k.lower() for k in query.split() if len(k) > 3]
+        if not keywords:
+            return []
+        
+        hits = []
+        try:
+            for f in self.config.RAG_CHUNKS.glob("*.md"):
+                try:
+                    text = f.read_text(encoding='utf-8', errors='ignore')
+                    score = sum(1 for k in keywords if k in text.lower())
+                    if score > 0:
+                        hits.append({
+                            "file": f.name,
+                            "score": score,
+                            "snippet": text[:500] + ("..." if len(text) > 500 else "")
+                        })
+                except:
+                    continue
+            
+            hits.sort(key=lambda x: x["score"], reverse=True)
+            return hits[:max_results]
+        except:
+            return []
+    
+    def inject_context(self, query: str) -> str:
+        """Get context string for injection into prompts"""
+        hits = self.search(query)
+        if not hits:
+            return ""
+        
+        context = "## Relevant Context from Knowledge Base:\n\n"
+        for h in hits:
+            context += f"**From {h['file']}** (relevance: {h['score']}/10):\n{h['snippet']}\n\n---\n\n"
+        return context
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ENHANCED ORCHESTRATOR V2
+# ══════════════════════════════════════════════════════════════════════════════
+
+class COGOrchestratorV2:
+    """
+    Enhanced orchestrator with batch processing, workflow templates, and performance dashboard
+    """
+    
+    def __init__(self):
+        self.config = Config()
+        self.key_status = load_keys(self.config.VAULT_ROOT)
+        self.monitor = MonitorState.load(self.config.MONITOR)
+        self.caller = Caller(self.config, self.monitor)
+        self.batch_caller = BatchCaller(self.config, self.monitor)
+        self.engine = ReasoningEngine(self.config, self.caller)
+        self.rag = SimpleRAG(self.config)
+        self.templates = WorkflowTemplate()  # Initialize templates
+        self.dashboard = PerformanceDashboard(self.monitor, self.config)
+    
+    def run(self, task: str, workflow: str = "code", output_format: str = "text", use_rag: bool = True) -> ReasoningResult:
+        """
+        Run a task through the 4-phase reasoning engine
+        """
+        # Inject RAG context if enabled
+        if use_rag:
+            context = self.rag.inject_context(task)
+            if context:
+                task = f"{task}\n\n{context}"
+        
+        # Run reasoning engine
+        result = self.engine.run(task, workflow, output_format)
+        
+        # Save monitor state
+        self.monitor.save(self.config.MONITOR)
+        
+        return result
+    
+    def batch_process(self, tasks: List[str], workflow: str = "code") -> List[ReasoningResult]:
+        """
+        Process multiple tasks efficiently using batch processing
+        Returns list of ReasoningResult objects
+        """
+        results = []
+        
+        # Prepare batch calls
+        calls = []
+        for task in tasks:
+            provider = self.caller.elect("coder" if workflow == "code" else "synthesizer")
+            if not provider:
+                provider = "deepseek"  # fallback
+            
+            system = "You are a helpful assistant. Complete the task thoroughly and concisely."
+            calls.append((provider, task, system))
+        
+        # Execute batch
+        batch_results = self.batch_caller.batch_call(calls)
+        
+        # Convert to ReasoningResult objects
+        for (response, meta), task in zip(batch_results, tasks):
+            result = ReasoningResult(
+                task_id=str(uuid.uuid4())[:8],
+                timestamp=datetime.now().isoformat(),
+                final_output=response or "",
+                output_format="text",
+                status="complete" if response else "failed",
+                providers_used=[meta.get("provider", "unknown")],
+                total_latency_ms=meta.get("latency_ms", 0),
+                error="" if response else meta.get("error", "Unknown error")
+            )
+            results.append(result)
+            
+            # Save individual result
+            artifact_path = self.config.ARTIFACTS / f"{result.task_id}_batch.json"
+            result.save(artifact_path)
+        
+        # Save monitor state
+        self.monitor.save(self.config.MONITOR)
+        
+        return results
+    
+    def run_template(self, template_name: str, task: str, use_rag: bool = True) -> List[ReasoningResult]:
+        """
+        Run a predefined workflow template
+        Returns list of ReasoningResult objects for each phase
+        """
+        template = self.templates.get_template(template_name)
+        if not template:
+            raise ValueError(f"Unknown template: {template_name}")
+        
+        # Inject RAG context if enabled
+        if use_rag:
+            context = self.rag.inject_context(task)
+            if context:
+                task = f"{task}\n\n{context}"
+        
+        results = []
+        previous_output = None
+        
+        for i, phase in enumerate(template["phases"]):
+            role = phase["role"]
+            system = phase["system"]
+            output_format = phase.get("output_format", "text")
+            
+            # Select provider (use template providers or default)
+            provider = None
+            if i < len(template.get("providers", [])):
+                candidate = template["providers"][i]
+                if candidate == "local" or has_key(candidate):
+                    provider = candidate
+            
+            if not provider:
+                provider = self.caller.elect(role)
+            
+            if not provider:
+                raise ValueError(f"No provider available for role: {role}")
+            
+            # Prepare prompt
+            if previous_output is None:
+                prompt = task
+            else:
+                prompt = f"""Previous phase output:
+{previous_output}
+
+Original task: {task}
+
+Now continue with the next phase."""
+            
+            # Call provider
+            response, meta = self.caller.call(provider, prompt, system)
+            
+            # Create result
+            result = ReasoningResult(
+                task_id=f"{template_name}_{uuid.uuid4()[:8]}",
+                timestamp=datetime.now().isoformat(),
+                final_output=response or "",
+                output_format=output_format,
+                status="complete" if response else "failed",
+                providers_used=[provider],
+                total_latency_ms=meta.get("latency_ms", 0),
+                error="" if response else meta.get("error", "Unknown error")
+            )
+            
+            results.append(result)
+            previous_output = response or ""
+            
+            # Save phase result
+            phase_path = self.config.ARTIFACTS / f"{result.task_id}_{template_name}_phase{i+1}.json"
+            result.save(phase_path)
+        
+        # Save monitor state
+        self.monitor.save(self.config.MONITOR)
+        
+        return results
+    
+    def quick_call(self, provider: str, prompt: str, system: str = None, json_mode: bool = False) -> Tuple[Optional[str], Dict]:
+        """Direct provider call without reasoning loop"""
+        result = self.caller.call(provider, prompt, system, json_mode)
+        self.monitor.save(self.config.MONITOR)
+        return result
+    
+    def status(self) -> Dict:
+        """Get comprehensive system status"""
+        available = []
+        unavailable = []
+        
+        for provider in PROVIDERS:
+            if provider == "local":
+                if self.caller.check_ollama():
+                    available.append(provider)
+                else:
+                    unavailable.append(provider)
+            elif has_auth(provider):
+                available.append(provider)
+            else:
+                unavailable.append(provider)
+        
+        # Check RAG status
+        rag_count = 0
+        if self.config.RAG_CHUNKS.exists():
+            rag_count = len(list(self.config.RAG_CHUNKS.glob("*.md")))
+        
+        return {
+            "system": {
+                "vault": str(self.config.VAULT_ROOT),
+                "version": "2.0.0",
+                "config": self.config.to_dict()
+            },
+            "providers": {
+                "available": available,
+                "unavailable": unavailable,
+                "total": len(PROVIDERS)
+            },
+            "performance": self.monitor.get_summary(),
+            "storage": {
+                "artifacts": len(list(self.config.ARTIFACTS.glob("*.json"))),
+                "rag_chunks": rag_count,
+                "monitor_size": self.config.MONITOR.stat().st_size if self.config.MONITOR.exists() else 0
+            },
+            "templates": {
+                "available": list(self.templates.TEMPLATES.keys()),
+                "count": len(self.templates.TEMPLATES)
+            },
+            "circuit_breaker": self.caller.circuit_breaker.get_status()
+        }
+    
+    def get_dashboard(self, format: str = "markdown") -> str:
+        """Get performance dashboard report"""
+        return self.dashboard.generate_report(format)
+    
+    def reset_monitor(self):
+        """Reset monitoring data"""
+        self.monitor = MonitorState()
+        self.monitor.save(self.config.MONITOR)
+    
+    def export_data(self, output_dir: Path = None) -> Path:
+        """Export all system data to a directory"""
+        if output_dir is None:
+            output_dir = self.config.PROTOCOLS / "exports" / f"export_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Export monitor data
+        monitor_data = self.monitor.get_summary()
+        (output_dir / "monitor.json").write_text(json.dumps(monitor_data, indent=2))
+        
+        # Export provider status
+        provider_status = {
+            "available": [p for p in PROVIDERS if has_auth(p) or (p == "local" and self.caller.check_ollama())],
+            "unavailable": [p for p in PROVIDERS if not has_auth(p) and not (p == "local" and self.caller.check_ollama())]
+        }
+        (output_dir / "providers.json").write_text(json.dumps(provider_status, indent=2))
+        
+        # Export recent artifacts (last 50)
+        artifacts_dir = output_dir / "artifacts"
+        artifacts_dir.mkdir(exist_ok=True)
+        
+        all_artifacts = sorted(
+            self.config.ARTIFACTS.glob("*.json"),
+            key=lambda x: x.stat().st_mtime,
+            reverse=True
+        )[:50]
+        
+        for artifact in all_artifacts:
+            try:
+                dest = artifacts_dir / artifact.name
+                dest.write_text(artifact.read_text())
+            except:
+                pass
+        
+        return output_dir
+    
+    def export_metrics(self, format: str = "markdown") -> str:
+        """Export metrics in various formats"""
+        return self.get_dashboard(format)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CLI INTERFACE
+# ══════════════════════════════════════════════════════════════════════════════
+
+def main():
+    """Command-line interface for COG V2"""
+    
+    print("\n" + "="*70)
+    print("  COG FOUNDATION V2 - Enhanced Multi-AI Orchestration")
+    print("  + Key Normalization | Circuit Breaker | Max Tokens Control")
+    print("="*70 + "\n")
+    
+    orc = COGOrchestratorV2()
+    
+    # Handle flags first
+    if "--report" in sys.argv:
+        print(orc.export_metrics("markdown"))
+        return
+    
+    # Show status
+    status = orc.status()
+    
+    print(f"📍 Vault: {status['system']['vault']}")
+    print(f"📊 Version: {status['system']['version']}")
+    print(f"⚙️  Config: Timeout={status['system']['config']['timeout']}s, MaxTokens={status['system']['config']['max_tokens']}")
+    print(f"🤖 Available providers: {', '.join(status['providers']['available'])}")
+    print(f"📈 Total calls: {status['performance']['total_calls']:,}")
+    print(f"💰 Total cost: ${status['performance']['total_cost']:.6f}")
+    print(f"📚 RAG chunks: {status['storage']['rag_chunks']}")
+    print(f"📋 Templates: {', '.join(status['templates']['available'])}")
+    
+    # Show circuit breaker status
+    cb_status = status.get('circuit_breaker', {})
+    open_circuits = [p for p, s in cb_status.items() if s == 'open']
+    if open_circuits:
+        print(f"⚠️  Circuit breaker OPEN for: {', '.join(open_circuits)}")
+    
+    print()
+    
+    if len(sys.argv) > 1:
+        # Skip flags that were already processed
+        args = [arg for arg in sys.argv[1:] if arg != "--report"]
+        if not args:
+            print("Usage: python cog_foundation_v2.py <task>")
+            print("\nCommands:")
+            print("  python cog_foundation_v2.py --report    Show performance report")
+            print("  python cog_foundation_v2.py dashboard   Show dashboard")
+            print("  python cog_foundation_v2.py batch <task1> <task2> ...")
+            print("  python cog_foundation_v2.py template <name> <task>")
+            return
+        
+        command = args[0].lower()
+        
+        if command == "dashboard":
+            print(orc.get_dashboard("text"))
+        
+        elif command == "batch" and len(args) > 1:
+            tasks = args[1:]
+            print(f"Processing {len(tasks)} tasks in batch...\n")
+            results = orc.batch_process(tasks)
+            
+            success = sum(1 for r in results if r.status == "complete")
+            print(f"✅ Batch complete: {success}/{len(results)} successful")
+            for i, result in enumerate(results, 1):
+                status_icon = "✅" if result.status == "complete" else "❌"
+                print(f"  {status_icon} Task {i}: {result.status} ({result.total_latency_ms}ms)")
+        
+        elif command == "template" and len(args) > 2:
+            template_name = args[1]
+            task = " ".join(args[2:])
+            
+            print(f"Running template '{template_name}'...\n")
+            try:
+                results = orc.run_template(template_name, task)
+                print(f"✅ Template '{template_name}' complete ({len(results)} phases)")
+                for i, result in enumerate(results, 1):
+                    print(f"\nPhase {i} ({result.providers_used[0]}):")
+                    print("-" * 40)
+                    print(result.final_output[:500])
+                    if len(result.final_output) > 500:
+                        print(f"... ({len(result.final_output) - 500} more chars)")
+            except Exception as e:
+                print(f"❌ Error: {e}")
+        
+        elif command == "export":
+            export_dir = orc.export_data()
+            print(f"✅ Data exported to: {export_dir}")
+        
+        elif command == "reset":
+            orc.reset_monitor()
+            print("✅ Monitor data reset")
+        
+        else:
+            # Default: run single task through reasoning engine
+            task = " ".join(args)
+            print(f"Task: {task}\n")
+            print("Running 4-phase reasoning...\n")
+            
+            result = orc.run(task, workflow="code", output_format="text")
+            
+            print(f"\nStatus: {result.status}")
+            print(f"Task ID: {result.task_id}")
+            print(f"Total latency: {result.total_latency_ms}ms")
+            print(f"Providers used: {', '.join(result.providers_used)}")
+            
+            # Show execution log with tokens
+            if result.execution_log:
+                print("\nExecution Log:")
+                for log in result.execution_log:
+                    status_icon = "✓" if log["success"] else "✗"
+                    tokens = f"({log.get('tokens_in', 0)}→{log.get('tokens_out', 0)} tokens)" if log.get('tokens_in') else ""
+                    print(f"  {status_icon} {log['phase']}: {log['provider']} {log['latency_ms']}ms {tokens}")
+            
+            if result.branches:
+                print(f"\nApproaches considered: {len(result.branches)}")
+                print(f"Selected: Approach {result.selected_branch + 1}")
+            
+            if result.final_output:
+                print("\n" + "-"*60)
+                print("OUTPUT:")
+                print("-"*60)
+                print(result.final_output[:2000])
+                if len(result.final_output) > 2000:
+                    print(f"\n... ({len(result.final_output) - 2000} more chars)")
+            
+            if result.error:
+                print(f"\n❌ Error: {result.error}")
+            
+            # Show updated totals
+            print(f"\n[Session totals: {orc.monitor.total_calls} calls | ${orc.monitor.total_cost:.6f}]")
+    else:
+        print("Usage:")
+        print("  python cog_foundation_v2.py <task>          # Run single task")
+        print("  python cog_foundation_v2.py dashboard       # Show performance dashboard")
+        print("  python cog_foundation_v2.py --report        # Show performance report")
+        print("  python cog_foundation_v2.py batch <task1> <task2> ...  # Batch process")
+        print("  python cog_foundation_v2.py template <name> <task>     # Run template")
+        print("  python cog_foundation_v2.py export          # Export system data")
+        print("  python cog_foundation_v2.py reset           # Reset monitor data")
+        print()
+        print("Templates available:")
+        for template in orc.templates.list_templates():
+            print(f"  • {template['name']}: {template['description']}")
+
+
+if __name__ == "__main__":
+    main()
